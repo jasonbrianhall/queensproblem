@@ -2,11 +2,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <unistd.h>
 
 int n;
-int *board;
+__thread int *board;
 int solutions_count = 0;
 int unique_count = 0;
+int num_cores = 0;
+
+// Forward declarations
+int is_safe_with_board(int row, int col, int *b);
+void generate_work_queue(int row, int *partial_board);
+
+// Mutex for synchronizing print operations and shared data access
+pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t data_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Thread work structure - represents a partial board state to solve from
+typedef struct {
+    int *board;  // Partial board configuration
+    int depth;   // Starting depth (which row to start solving from)
+} WorkItem;
+
+// Work queue for distributing partial solutions
+typedef struct {
+    WorkItem *items;
+    int capacity;
+    int size;
+} WorkQueue;
+
+WorkQueue work_queue;
+int parallelization_depth = 0;
 
 // Hash set to store canonical solutions with their unique ID
 typedef struct {
@@ -153,7 +180,57 @@ void print_solution(int *b, int num) {
 }
 
 /**
- * Check if it's safe to place a queen
+ * Add a work item to the queue
+ */
+void add_work_item(int *partial_board) {
+    if (work_queue.size >= work_queue.capacity) {
+        work_queue.capacity *= 2;
+        work_queue.items = (WorkItem *)realloc(work_queue.items,
+                                               work_queue.capacity * sizeof(WorkItem));
+    }
+    
+    WorkItem *item = &work_queue.items[work_queue.size];
+    item->board = (int *)malloc(n * sizeof(int));
+    memcpy(item->board, partial_board, n * sizeof(int));
+    item->depth = parallelization_depth;
+    work_queue.size++;
+}
+
+/**
+ * Check if it's safe to place a queen (using provided board)
+ */
+int is_safe_with_board(int row, int col, int *b) {
+    for (int i = 0; i < row; i++) {
+        if (b[i] == col) {
+            return 0;
+        }
+        if (abs(b[i] - col) == abs(i - row)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/**
+ * Generate all partial board configurations up to parallelization_depth
+ */
+void generate_work_queue(int row, int *partial_board) {
+    if (row == parallelization_depth) {
+        // Found a valid partial board - add to work queue
+        add_work_item(partial_board);
+        return;
+    }
+    
+    for (int col = 0; col < n; col++) {
+        if (is_safe_with_board(row, col, partial_board)) {
+            partial_board[row] = col;
+            generate_work_queue(row + 1, partial_board);
+        }
+    }
+}
+
+/**
+ * Check if it's safe to place a queen (using thread-local board)
  */
 int is_safe(int row, int col) {
     for (int i = 0; i < row; i++) {
@@ -172,6 +249,9 @@ int is_safe(int row, int col) {
  */
 void solve_nqueens(int row) {
     if (row == n) {
+        // Protect all shared data access with mutex
+        pthread_mutex_lock(&data_mutex);
+        
         solutions_count++;
         
         // Get canonical form
@@ -183,22 +263,29 @@ void solve_nqueens(int row) {
             // This is a new unique solution
             unique_count++;
             add_to_set(canonical, unique_count);
-            
+        } else {
+            // This is a symmetric duplicate of an existing unique solution
+            free(canonical);
+        }
+        
+        pthread_mutex_unlock(&data_mutex);
+        
+        // Now print with print_mutex (separate to not hold data_mutex while printing)
+        pthread_mutex_lock(&print_mutex);
+        
+        if (unique_id == -1) {
             printf("\n═══════════════════════════════════════════════════════════\n");
             printf("Solution #%d (UNIQUE #%d)\n", solutions_count, unique_count);
             printf("═══════════════════════════════════════════════════════════\n");
             print_solution(board, solutions_count);
         } else {
-            // This is a symmetric duplicate of an existing unique solution
-            free(canonical);
-            
-            if (n <= 8) {
-                printf("\n───────────────────────────────────────────────────────────\n");
-                printf("Solution #%d (variant of Unique #%d)\n", solutions_count, unique_id);
-                printf("───────────────────────────────────────────────────────────\n");
-                print_solution(board, solutions_count);
-            }
+            printf("\n───────────────────────────────────────────────────────────\n");
+            printf("Solution #%d (variant of Unique #%d)\n", solutions_count, unique_id);
+            printf("───────────────────────────────────────────────────────────\n");
+            print_solution(board, solutions_count);
         }
+        
+        pthread_mutex_unlock(&print_mutex);
         return;
     }
     
@@ -208,6 +295,42 @@ void solve_nqueens(int row) {
             solve_nqueens(row + 1);
         }
     }
+}
+
+// Mutex for work queue access
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+int queue_index = 0;
+
+/**
+ * Thread worker function
+ * Each thread picks work items from the queue and solves them
+ */
+void *thread_worker(void *arg) {
+    // Each thread gets its own board (thread-local storage)
+    board = (int *)malloc(n * sizeof(int));
+    
+    while (1) {
+        // Get next work item from queue
+        pthread_mutex_lock(&queue_mutex);
+        if (queue_index >= work_queue.size) {
+            pthread_mutex_unlock(&queue_mutex);
+            break;  // No more work
+        }
+        
+        WorkItem *item = &work_queue.items[queue_index];
+        queue_index++;
+        
+        pthread_mutex_unlock(&queue_mutex);
+        
+        // Copy the partial board to thread-local board
+        memcpy(board, item->board, n * sizeof(int));
+        
+        // Solve from the parallelization depth
+        solve_nqueens(item->depth);
+    }
+    
+    free(board);
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
@@ -221,7 +344,12 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    board = (int *)malloc(n * sizeof(int));
+    // Detect number of CPU cores
+    num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_cores < 1) {
+        num_cores = 1;
+    }
+    
     solution_set.capacity = 1000;
     solution_set.solutions = (char **)malloc(solution_set.capacity * sizeof(char *));
     solution_set.unique_ids = (int *)malloc(solution_set.capacity * sizeof(int));
@@ -231,14 +359,55 @@ int main(int argc, char *argv[]) {
     printf("║  UNIQUE SOLUTIONS (ACCOUNTING FOR SYMMETRY)  QUEENS-%3d    ║\n", n);
     printf("║  Solutions that are the same after rotation or reflection  ║\n");
     printf("║  are counted as one unique solution                        ║\n");
+    printf("║  Detected %d CPU core(s) - using multi-threading          ║\n", num_cores);
     printf("╚════════════════════════════════════════════════════════════╝\n\n");
     
     clock_t start = clock();
-    solve_nqueens(0);
+    
+    // Calculate parallelization depth
+    // Higher depth = more granular work items = better load balancing on many cores
+    // For most cases, depth 3-4 provides good balance between generation cost and work granularity
+    parallelization_depth = (n > 6) ? 4 : (n > 4) ? 3 : 2;
+    if (parallelization_depth > n - 1) {
+        parallelization_depth = n - 1;
+    }
+    
+    // Initialize work queue
+    work_queue.capacity = 10000;
+    work_queue.items = (WorkItem *)malloc(work_queue.capacity * sizeof(WorkItem));
+    work_queue.size = 0;
+    
+    // Generate all partial boards up to parallelization depth
+    int *partial_board = (int *)malloc(n * sizeof(int));
+    memset(partial_board, -1, n * sizeof(int));
+    generate_work_queue(0, partial_board);
+    free(partial_board);
+    
+    printf("║  Parallelization depth: %d | Work items: %d           ║\n", 
+           parallelization_depth, work_queue.size);
+    printf("╚════════════════════════════════════════════════════════════╝\n\n");
+    
+    // Create threads
+    pthread_t *threads = (pthread_t *)malloc(num_cores * sizeof(pthread_t));
+    int *thread_created = (int *)malloc(num_cores * sizeof(int));
+    memset(thread_created, 0, num_cores * sizeof(int));
+    
+    for (int i = 0; i < num_cores; i++) {
+        pthread_create(&threads[i], NULL, thread_worker, NULL);
+        thread_created[i] = 1;
+    }
+    
+    // Wait for all created threads to complete
+    for (int i = 0; i < num_cores; i++) {
+        if (thread_created[i]) {
+            pthread_join(threads[i], NULL);
+        }
+    }
+    
     clock_t end = clock();
     double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
     
-    printf("Time: %.6f seconds\n", elapsed);
+    printf("\nTime: %.6f seconds\n", elapsed);
     
     printf("\n╔════════════════════════════════════════════════════════════╗\n");
     printf("║ Total solutions found:          %-27d║\n", solutions_count);
@@ -255,7 +424,20 @@ int main(int argc, char *argv[]) {
     }
     free(solution_set.solutions);
     free(solution_set.unique_ids);
-    free(board);
+    
+    // Cleanup work queue
+    for (int i = 0; i < work_queue.size; i++) {
+        free(work_queue.items[i].board);
+    }
+    free(work_queue.items);
+    
+    free(threads);
+    free(thread_created);
+    
+    // Destroy mutexes
+    pthread_mutex_destroy(&print_mutex);
+    pthread_mutex_destroy(&data_mutex);
+    pthread_mutex_destroy(&queue_mutex);
     
     return 0;
 }
